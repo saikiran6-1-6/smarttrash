@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Waste Classifier - Bin Gateway</title>
+    <!-- TensorFlow.js and TFLite are loaded by the script below, with fallbacks -->
+    <!-- MQTT over WebSockets -->
+    <script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background-color: #f4f4f9; margin: 0; padding: 20px; }
+        h1 { color: #333; font-size: 22px; }
+        #video-container { position: relative; display: inline-block; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.2); }
+        video { width: 100%; max-width: 500px; transform: scaleX(-1); } /* mirror view (display only) */
+        #result { margin-top: 16px; font-size: 24px; font-weight: bold; color: #2e7d32; }
+        .row { margin-top: 10px; color: #444; font-size: 14px; }
+        .ok { color: #2e7d32; } .bad { color: #c62828; }
+        #status { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <h1>Real-time Waste Classifier <small>(v3)</small></h1>
+    <div id="status">Starting...</div>
+    <br>
+    <div id="video-container">
+        <video id="webcam" autoplay playsinline muted></video>
+    </div>
+    <div id="result">Prediction will appear here</div>
+    <div class="row">MQTT: <span id="mqttState" class="bad">connecting...</span></div>
+    <div class="row">GPS: <span id="gpsState" class="bad">waiting...</span></div>
+    <div class="row">Last sent: <span id="lastSent">nothing yet</span></div>
+    <div class="row"><label><input type="checkbox" id="autoSend" checked> Send classifications automatically</label></div>
+
+    <script>
+        // ---------------- configuration ----------------
+        const TEAM = "teamscu001";                 // CHANGE: must match main.py and Node-RED
+        const BIN = "bin01";
+        const PREFIX = TEAM + "/" + BIN + "/";
+        const BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+
+        const THRESHOLD = 0.85;               // minimum confidence to send
+        const STABLE_FRAMES = 3;              // same class this many frames in a row
+        const COOLDOWN_MS = 4000;             // minimum time between sent classifications
+        const INTERVAL_MS = 200;              // time between predictions
+
+        // Training order of the model's output classes
+        const classes = ['Green_Organic', 'Landfill', 'Recycled'];
+        // Names the edge node (main.py) understands
+        const toCommand = { Green_Organic: 'green', Landfill: 'landfill', Recycled: 'recycled' };
+
+        // ---------------- state ----------------
+        let model;
+        let mqttClient;
+        let streakClass = null, streak = 0, lastSent = 0;
+        const video = document.getElementById('webcam');
+        const statusDiv = document.getElementById('status');
+        const resultDiv = document.getElementById('result');
+        const mqttState = document.getElementById('mqttState');
+        const gpsState = document.getElementById('gpsState');
+        const lastSentSpan = document.getElementById('lastSent');
+        const autoSend = document.getElementById('autoSend');
+
+        // ---------------- MQTT ----------------
+        function setupMqtt() {
+            const clientId = "phone-" + Math.random().toString(16).slice(2, 8);
+            mqttClient = mqtt.connect(BROKER_URL, { clientId: clientId, reconnectPeriod: 3000 });
+            mqttClient.on('connect', () => { mqttState.textContent = "connected"; mqttState.className = "ok"; });
+            mqttClient.on('reconnect', () => { mqttState.textContent = "reconnecting..."; mqttState.className = "bad"; });
+            mqttClient.on('close', () => { mqttState.textContent = "disconnected"; mqttState.className = "bad"; });
+            mqttClient.on('error', (e) => { mqttState.textContent = "error: " + e.message; mqttState.className = "bad"; });
+        }
+
+        // ---------------- GPS ----------------
+        function setupGps() {
+            if (!navigator.geolocation) { gpsState.textContent = "not supported"; return; }
+            navigator.geolocation.watchPosition(
+                (p) => {
+                    const lat = p.coords.latitude, lon = p.coords.longitude;
+                    gpsState.textContent = lat.toFixed(5) + ", " + lon.toFixed(5);
+                    gpsState.className = "ok";
+                    if (mqttClient && mqttClient.connected) {
+                        mqttClient.publish(PREFIX + "location", JSON.stringify({ lat: lat, lon: lon }), { retain: true });
+                    }
+                },
+                (e) => { gpsState.textContent = "error: " + e.message; gpsState.className = "bad"; },
+                { enableHighAccuracy: true, maximumAge: 5000 }
+            );
+        }
+
+        // ---------------- script loader with fallbacks ----------------
+        const TFJS_URLS = [
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js",
+            "https://unpkg.com/@tensorflow/tfjs@3.20.0/dist/tf.min.js"
+        ];
+        const TFLITE_URLS = [
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/tf-tflite.min.js",
+            "https://unpkg.com/@tensorflow/tfjs-tflite@0.0.1-alpha.9/dist/tf-tflite.min.js",
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite@0.0.1-alpha.10/dist/tf-tflite.min.js",
+            "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-tflite/dist/tf-tflite.min.js"
+        ];
+
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                const s = document.createElement('script');
+                s.src = src;
+                s.onload = resolve;
+                s.onerror = () => reject(new Error("could not load " + src));
+                document.head.appendChild(s);
+            });
+        }
+
+        async function loadFirst(urls, isReady, label) {
+            for (const u of urls) {
+                try {
+                    statusDiv.innerText = "Loading " + label + "...";
+                    await loadScript(u);
+                    if (isReady()) { console.log(label + " loaded from " + u); return u; }
+                } catch (e) { console.warn(e.message); }
+            }
+            throw new Error(label + " failed to load from every source:\n" + urls.join("\n"));
+        }
+
+        // ---------------- camera + model ----------------
+        async function setupApp() {
+            try {
+                if (typeof mqtt === 'undefined') throw new Error("MQTT library did not load (check your internet connection)");
+                await loadFirst(TFJS_URLS, () => window.tf, "TensorFlow.js");
+                await loadFirst(TFLITE_URLS, () => window.tflite, "TFLite runtime");
+                setupMqtt();
+                setupGps();
+
+                statusDiv.innerText = "Starting camera...";
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' },
+                    audio: false
+                });
+                video.srcObject = stream;
+
+                statusDiv.innerText = "Loading TFLite model...";
+                model = await tflite.loadTFLiteModel('./waste_classifier.tflite');
+                statusDiv.innerText = "Model loaded. Classifying...";
+
+                loop();
+            } catch (err) {
+                statusDiv.innerText = "Error starting app: " + err.message;
+                console.error(err);
+            }
+        }
+
+        // If the model outputs raw scores instead of probabilities, convert them
+        function toProbabilities(arr) {
+            const a = Array.from(arr);
+            const sum = a.reduce((s, v) => s + v, 0);
+            if (a.every(v => v >= 0 && v <= 1) && Math.abs(sum - 1) < 0.05) return a;
+            const m = Math.max(...a);
+            const ex = a.map(v => Math.exp(v - m));
+            const s = ex.reduce((x, y) => x + y, 0);
+            return ex.map(v => v / s);
+        }
+
+        async function classifyOnce() {
+            if (video.readyState < 2) return;
+
+            // Video frame -> centre-cropped, 224x224, scaled to [-1, 1]
+            const imgTensor = tf.tidy(() => {
+                let img = tf.browser.fromPixels(video);
+                const minDim = Math.min(img.shape[0], img.shape[1]);
+                const startY = Math.floor((img.shape[0] - minDim) / 2);
+                const startX = Math.floor((img.shape[1] - minDim) / 2);
+                img = img.slice([startY, startX, 0], [minDim, minDim, 3]);
+                return tf.image.resizeBilinear(img, [224, 224])
+                         .div(127.5)
+                         .sub(1.0)
+                         .expandDims(0);
+            });
+
+            const outputTensor = model.predict(imgTensor);
+            const raw = await outputTensor.data();
+            imgTensor.dispose();
+            outputTensor.dispose();
+
+            const probs = toProbabilities(raw);
+            const maxIndex = probs.indexOf(Math.max(...probs));
+            const conf = probs[maxIndex];
+            const cls = classes[maxIndex];
+
+            resultDiv.innerText = "Prediction: " + cls + " (" + (conf * 100).toFixed(1) + "%)";
+
+            // Send only confident, stable predictions, at most once per cooldown
+            if (autoSend.checked && conf >= THRESHOLD && mqttClient && mqttClient.connected) {
+                if (cls === streakClass) { streak++; } else { streakClass = cls; streak = 1; }
+                if (streak >= STABLE_FRAMES && Date.now() - lastSent > COOLDOWN_MS) {
+                    const payload = {
+                        class: toCommand[cls],
+                        confidence: +conf.toFixed(2),
+                        ts: Date.now()
+                    };
+                    mqttClient.publish(PREFIX + "classify", JSON.stringify(payload));
+                    lastSent = Date.now();
+                    streak = 0;
+                    lastSentSpan.textContent = payload.class + " (" + payload.confidence + ") at " + new Date().toLocaleTimeString();
+                }
+            } else {
+                streakClass = null;
+                streak = 0;
+            }
+        }
+
+        // Prediction loop (one prediction at a time, about every 200 ms)
+        async function loop() {
+            const t0 = performance.now();
+            try { await classifyOnce(); } catch (e) { console.error(e); }
+            const wait = Math.max(0, INTERVAL_MS - (performance.now() - t0));
+            setTimeout(loop, wait);
+        }
+
+        setupApp();
+    </script>
+</body>
+</html>
